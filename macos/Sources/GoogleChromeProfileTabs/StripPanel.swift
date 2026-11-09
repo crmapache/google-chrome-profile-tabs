@@ -69,6 +69,8 @@ import AppKit
         )
         let rect = AX.toCocoa(strip)
         if frame != rect {
+            // A tooltip would be left hanging where the strip was.
+            tabsView.hideTooltip()
             setFrame(rect, display: true)
             shadowStale = true
         }
@@ -82,6 +84,7 @@ import AppKit
     }
 
     func hide() {
+        tabsView.hideTooltip()
         if isVisible {
             orderOut(nil)
         }

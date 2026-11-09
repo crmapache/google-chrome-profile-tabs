@@ -52,6 +52,13 @@ std::set<std::wstring> Settings::hidden() const {
 
 void Settings::setHidden(const std::set<std::wstring>& dirs) { setStrings(L"Hidden", {dirs.begin(), dirs.end()}); }
 
+std::set<std::wstring> Settings::collapsed() const {
+    auto values = strings(L"Collapsed");
+    return {values.begin(), values.end()};
+}
+
+void Settings::setCollapsed(const std::set<std::wstring>& dirs) { setStrings(L"Collapsed", {dirs.begin(), dirs.end()}); }
+
 std::map<std::wstring, std::wstring> Settings::customNames() const {
     std::map<std::wstring, std::wstring> names;
     HKEY key;
@@ -107,13 +114,13 @@ std::vector<Profile> Settings::arrange(const std::vector<Profile>& profiles) con
     return arranged;
 }
 
-// A new order of the visible tabs. Hidden profiles keep their places among the rest.
+// A new order of the tabs in the row. Hidden and collapsed profiles keep their places among the rest.
 void Settings::reorder(const std::vector<std::wstring>& visible, const std::vector<Profile>& profiles) {
-    auto hiddenDirs = hidden();
+    std::set<std::wstring> shown(visible.begin(), visible.end());
     std::vector<std::wstring> next;
     size_t index = 0;
     for (const auto& profile : arrange(profiles)) {
-        if (hiddenDirs.count(profile.dir) || index >= visible.size()) next.push_back(profile.dir);
+        if (!shown.count(profile.dir) || index >= visible.size()) next.push_back(profile.dir);
         else next.push_back(visible[index++]);
     }
     setOrder(next);

@@ -42,6 +42,7 @@ private:
     std::set<HWND> pendingKnown_;
     ULONGLONG pendingDeadline_ = 0;
     HWND pendingForeground_ = nullptr;  // who had the keyboard when the window was asked for
+    bool pendingDiscard_ = false;       // the profile was closed meanwhile: its window closes on arrival
 
     bool dragging_ = false;
     HWND draggedWindow_ = nullptr;
@@ -52,6 +53,12 @@ private:
     bool hotkeysOn_ = false;
     HWINEVENTHOOK systemHook_ = nullptr, objectHook_ = nullptr, cloakHook_ = nullptr;
     DWORD hookedPid_ = 0;
+    // Profiles with a window, as of the last refresh.
+    std::set<std::wstring> open_;
+    // When each window was asked to close. One still there a while later was kept by its page ("Leave
+    // site?") or by the user, and its profile stays open.
+    std::map<HWND, ULONGLONG> closeAsked_;
+    // The tabs in the row, in order: Alt+1...9 count these. Collapsed profiles are not among them.
     std::vector<Profile> visibleTabs_;
 
     static App* self_;
@@ -65,7 +72,8 @@ private:
     void refresh();
     void hookBrowser(DWORD pid);
     void setHotkeys(bool on);
-    void showTabs(const std::set<std::wstring>& open);
+    void showTabs();
+    Tab tabFor(const Profile& profile, bool namesHidden) const;
     std::wstring titleFor(const std::wstring& dir) const;
     void layout();
     void follow();
@@ -75,6 +83,12 @@ private:
     void open(const std::wstring& dir, const RECT* frame);
     void resolvePending(const std::vector<BrowserWindow>& windows);
     void stopPending();
+    void close(const std::wstring& dir);
+    void collapse(const std::wstring& dir);
+    void requestClose(HWND hwnd);
+    void expand(const std::wstring& dir);
+    void expandAndSelect(const std::wstring& dir);
+    void finishClosing(const std::vector<BrowserWindow>& windows);
     void beginRename(const std::wstring& dir);
     void rename(const std::wstring& dir, const std::wstring& text);
     void editingEnded();
@@ -116,6 +130,9 @@ bool App::start(HINSTANCE instance) {
     if (!control_ || !strip_.create(instance)) return false;
 
     strip_.onSelect = [this](const std::wstring& dir) { select(dir); };
+    strip_.onClose = [this](const std::wstring& dir) { close(dir); };
+    strip_.onCollapse = [this](const std::wstring& dir) { collapse(dir); };
+    strip_.onExpand = [this](const std::wstring& dir) { expandAndSelect(dir); };
     strip_.onReorder = [this](const std::vector<std::wstring>& dirs) {
         settings_->reorder(dirs, profiles_->profiles());
         refresh();
@@ -249,6 +266,7 @@ void App::refresh() {
     std::vector<BrowserWindow> windows = windows_->list();
     hookBrowser(windows_->browserPid());
     resolvePending(windows);
+    finishClosing(windows);
 
     HWND foreground = GetForegroundWindow();
     // Only browser windows: DevTools and installed web apps keep their own Alt shortcuts.
@@ -287,31 +305,40 @@ void App::refresh() {
     attached_ = chosen ? chosen->hwnd : nullptr;
     attachedDir_ = chosen ? chosen->dir : L"";
 
-    std::set<std::wstring> open;
-    for (const auto& window : windows) open.insert(window.dir);
-    showTabs(open);
+    open_.clear();
+    for (const auto& window : windows) open_.insert(window.dir);
+    showTabs();
     layout();
 }
 
-void App::showTabs(const std::set<std::wstring>& open) {
+void App::showTabs() {
     auto hidden = settings_->hidden();
+    auto collapsed = settings_->collapsed();
     bool namesHidden = settings_->namesHidden();
     visibleTabs_.clear();
-    std::vector<Tab> tabs;
+    std::vector<Tab> tabs, icons;
     for (const auto& profile : settings_->arrange(profiles_->profiles())) {
         if (hidden.count(profile.dir)) continue;
+        if (collapsed.count(profile.dir)) {
+            icons.push_back(tabFor(profile, namesHidden));
+            continue;
+        }
         visibleTabs_.push_back(profile);
-        Tab tab;
-        tab.key = profile.dir;
-        tab.title = titleFor(profile.dir);
-        tab.color = profile.color;
-        // The account photo gives a person away as well as a name, so it goes too while names are hidden.
-        tab.picture = namesHidden ? L"" : profile.picture;
-        tab.isOpen = open.count(profile.dir) > 0;
-        tab.signature = profile.signature + L"|" + tab.title + L"|" + (tab.isOpen ? L"1" : L"0") + L"|" + tab.picture;
-        tabs.push_back(tab);
+        tabs.push_back(tabFor(profile, namesHidden));
     }
-    strip_.show(tabs, attachedDir_, namesHidden);
+    strip_.show(tabs, icons, attachedDir_, namesHidden);
+}
+
+Tab App::tabFor(const Profile& profile, bool namesHidden) const {
+    Tab tab;
+    tab.key = profile.dir;
+    tab.title = titleFor(profile.dir);
+    tab.color = profile.color;
+    // The account photo gives a person away as well as a name, so it goes too while names are hidden.
+    tab.picture = namesHidden ? L"" : profile.picture;
+    tab.isOpen = open_.count(profile.dir) > 0;
+    tab.signature = profile.signature + L"|" + tab.title + L"|" + (tab.isOpen ? L"1" : L"0") + L"|" + tab.picture;
+    return tab;
 }
 
 // What the tab says: the user's own name or Chrome's, and gibberish made of it while names are hidden.
@@ -423,6 +450,7 @@ void App::open(const std::wstring& dir, const RECT* frame) {
     }
     pendingDeadline_ = GetTickCount64() + 20000;
     pendingForeground_ = GetForegroundWindow();
+    pendingDiscard_ = false;
     SetTimer(control_, kPending, 100, nullptr);
     if (!openProfile(target_, dir)) stopPending();
 }
@@ -432,6 +460,10 @@ void App::resolvePending(const std::vector<BrowserWindow>& windows) {
     for (const auto& window : windows) {
         if (window.dir != pendingDir_ || pendingKnown_.count(window.hwnd) || window.minimized) continue;
         stopPending();
+        if (pendingDiscard_) {
+            requestClose(window.hwnd);
+            return;
+        }
         if (pendingHasFrame_) setVisibleFrame(window.hwnd, pendingFrame_);
         // Chrome may take a while to open the window. If the user went to another program meanwhile, or
         // is renaming a tab, the window is only put in place: taking the keyboard would be a theft.
@@ -449,6 +481,65 @@ void App::resolvePending(const std::vector<BrowserWindow>& windows) {
 void App::stopPending() {
     pending_ = false;
     KillTimer(control_, kPending);
+}
+
+// ---------------------------------------------------------------- closing and collapsing
+
+// Closes every window of the profile, on every virtual desktop, and its pages stop taking memory. The tab
+// stays, paler.
+void App::close(const std::wstring& dir) {
+    logLine(L"close %ls", dir.c_str());
+    // A window still on its way for this profile is closed as soon as it shows up.
+    if (pending_ && pendingDir_ == dir) pendingDiscard_ = true;
+    for (const auto& window : windows_->list()) {
+        if (window.dir == dir) requestClose(window.hwnd);
+    }
+    refresh();
+}
+
+// Closes the profile and folds its tab into an icon at the right end of the strip.
+void App::collapse(const std::wstring& dir) {
+    auto collapsed = settings_->collapsed();
+    collapsed.insert(dir);
+    settings_->setCollapsed(collapsed);
+    close(dir);
+}
+
+// The same as the window's close button: a page may still ask whether to leave it.
+void App::requestClose(HWND hwnd) {
+    closeAsked_[hwnd] = GetTickCount64();
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+}
+
+// The icon goes back into the row as a tab.
+void App::expand(const std::wstring& dir) {
+    auto collapsed = settings_->collapsed();
+    collapsed.erase(dir);
+    settings_->setCollapsed(collapsed);
+    refresh();
+}
+
+// A click on the icon: the tab comes back and its profile opens.
+void App::expandAndSelect(const std::wstring& dir) {
+    expand(dir);
+    select(dir);
+}
+
+// A collapsed profile with a window that is not on its way out gets its tab back: the window was opened
+// after the close (from Chrome's menu, a link, before the strip started), or its page asked to stay.
+void App::finishClosing(const std::vector<BrowserWindow>& windows) {
+    const ULONGLONG grace = 3000;
+    // Handles of closed windows get reused: only live ones stay remembered.
+    for (auto it = closeAsked_.begin(); it != closeAsked_.end();) it = IsWindow(it->first) ? std::next(it) : closeAsked_.erase(it);
+    ULONGLONG now = GetTickCount64();
+    auto collapsed = settings_->collapsed();
+    bool changed = false;
+    for (const auto& window : windows) {
+        auto asked = closeAsked_.find(window.hwnd);
+        bool leaving = asked != closeAsked_.end() && now - asked->second <= grace;
+        if (!leaving) changed |= collapsed.erase(window.dir) > 0;
+    }
+    if (changed) settings_->setCollapsed(collapsed);
 }
 
 // ---------------------------------------------------------------- names
@@ -497,16 +588,23 @@ void App::toggleNamesHidden() {
 // ---------------------------------------------------------------- menu
 
 void App::contextMenu(const std::wstring& dir, POINT point) {
-    enum { kRename = 1, kReset, kHide, kStartup, kQuit, kShowHidden = 100 };
+    enum { kRename = 1, kReset, kClose, kCollapse, kExpand, kHide, kStartup, kQuit, kShowHidden = 100 };
     HMENU menu = CreatePopupMenu();
     bool namesHidden = settings_->namesHidden();
     auto names = settings_->customNames();
-    if (!dir.empty()) {
+    if (!dir.empty() && settings_->collapsed().count(dir)) {
+        AppendMenuW(menu, MF_STRING, kExpand, L"Expand Tab");
+        AppendMenuW(menu, MF_STRING, kHide, L"Hide Tab");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    } else if (!dir.empty()) {
         if (!namesHidden) {
             AppendMenuW(menu, MF_STRING, kRename, L"Rename…");
             const Profile* profile = profiles_->find(dir);
             if (names.count(dir) && profile) AppendMenuW(menu, MF_STRING, kReset, (L"Reset Name to “" + profile->name + L"”").c_str());
         }
+        bool isOpen = open_.count(dir) > 0;
+        if (isOpen) AppendMenuW(menu, MF_STRING, kClose, L"Close Profile");
+        AppendMenuW(menu, MF_STRING, kCollapse, isOpen ? L"Close and Collapse to Icon" : L"Collapse to Icon");
         AppendMenuW(menu, MF_STRING, kHide, L"Hide Tab");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
@@ -543,6 +641,9 @@ void App::contextMenu(const std::wstring& dir, POINT point) {
     switch (command) {
         case kRename: beginRename(dir); break;
         case kReset: rename(dir, L""); break;
+        case kClose: close(dir); break;
+        case kCollapse: collapse(dir); break;
+        case kExpand: expand(dir); break;
         case kHide: {
             hidden.insert(dir);
             settings_->setHidden(hidden);
@@ -564,7 +665,9 @@ void App::contextMenu(const std::wstring& dir, POINT point) {
 // ---------------------------------------------------------------- test hooks
 
 // The test copy takes commands over WM_COPYDATA instead of synthetic clicks on the screen:
-// "select:<folder>", "rename:<folder>", "names", "dump", "snapshot".
+// "select:<folder>", "rename:<folder>", "close:<folder>", "collapse:<folder>", "expand:<folder>" (a click
+// on the icon), "hover:<x>" (the mouse over the strip at x DIPs from its left edge, off it for a negative x),
+// "names", "dump", "snapshot".
 void App::testCommand(const std::wstring& command) {
     logLine(L"test command %ls", command.c_str());
     auto argument = [&](const wchar_t* prefix) {
@@ -573,6 +676,10 @@ void App::testCommand(const std::wstring& command) {
     };
     if (!argument(L"select:").empty()) select(argument(L"select:"));
     else if (!argument(L"rename:").empty()) beginRename(argument(L"rename:"));
+    else if (!argument(L"close:").empty()) close(argument(L"close:"));
+    else if (!argument(L"collapse:").empty()) collapse(argument(L"collapse:"));
+    else if (!argument(L"expand:").empty()) expandAndSelect(argument(L"expand:"));
+    else if (!argument(L"hover:").empty()) strip_.hoverAt(std::wcstof(argument(L"hover:").c_str(), nullptr));
     else if (command == L"names") toggleNamesHidden();
     else if (command == L"dump") dumpState();
     else if (command == L"snapshot") {
@@ -610,6 +717,12 @@ void App::dumpState() {
     for (const auto& profile : visibleTabs_) {
         fwprintf(file, L"tab dir=%ls title=%ls color=%06x picture=%d\n", profile.dir.c_str(), titleFor(profile.dir).c_str(), profile.color,
                  !profile.picture.empty());
+    }
+    auto hidden = settings_->hidden(), collapsed = settings_->collapsed();
+    for (const auto& profile : settings_->arrange(profiles_->profiles())) {
+        if (collapsed.count(profile.dir) && !hidden.count(profile.dir)) {
+            fwprintf(file, L"icon dir=%ls title=%ls open=%d\n", profile.dir.c_str(), titleFor(profile.dir).c_str(), open_.count(profile.dir) > 0);
+        }
     }
     fclose(file);
 }

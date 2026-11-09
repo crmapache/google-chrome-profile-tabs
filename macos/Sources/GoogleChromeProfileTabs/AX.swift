@@ -72,6 +72,12 @@ enum AX {
         AXUIElementPerformAction(element, kAXRaiseAction as CFString)
     }
 
+    /// Presses the window's close button, as the user would: a page may still ask whether to leave it.
+    static func close(_ window: AXUIElement) -> Bool {
+        guard let button = element(window, kAXCloseButtonAttribute) else { return false }
+        return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
+    }
+
     /// Finds an element of the window's interface. Page content is skipped: it is huge, and the browser's
     /// buttons live outside it.
     static func find(in root: AXUIElement, limit: Int = 400, where match: (AXUIElement) -> Bool) -> AXUIElement? {

@@ -24,11 +24,23 @@ struct BrowserWindow {
     /// The window just switched to. The browser reports its new main window a moment later, and without
     /// this the strip would jump back for an instant.
     private var sticky: (id: CGWindowID, until: Date)?
-    /// A profile whose new window was asked for: when it shows up it goes where the current one is.
-    private var pending: (profile: String, frame: CGRect?, known: Set<CGWindowID>, deadline: Date)?
+    /// A profile whose new window was asked for: when it shows up it goes where the current one is. If the
+    /// profile was closed meanwhile (discard), the window is closed as soon as it shows up.
+    private var pending: (profile: String, frame: CGRect?, known: Set<CGWindowID>, deadline: Date, discard: Bool)?
     /// The app in front when the new window was asked for.
     private var pendingFrontmost: pid_t?
     private var profileByWindow: [CGWindowID: String] = [:]
+    /// Profiles with a window, as of the last refresh.
+    private var openProfiles = Set<String>()
+    /// Profiles closed from the strip, with every browser window that existed at that moment on any desktop.
+    /// The strip sees the windows of the current desktop only, so the profile's windows elsewhere are closed
+    /// when they come into view. A window of the profile not among these was opened after the close.
+    private var closing: [String: Set<CGWindowID>] = [:]
+    /// When each window was asked to close. One still there a while later was kept by its page ("Leave
+    /// site?") or by the user, and its profile stays open.
+    private var closeAsked: [CGWindowID: Date] = [:]
+    private static let closeGrace: TimeInterval = 3
+    /// The tabs in the row, in order: Ctrl+1...9 count these. Collapsed profiles are not among them.
     private var visibleTabs: [Profile] = []
     private var timers: [Timer] = []
     private var pendingPoll: Timer?
@@ -48,6 +60,9 @@ struct BrowserWindow {
 
     func start() {
         strip.tabsView.onSelect = { [weak self] name in self?.select(name) }
+        strip.tabsView.onClose = { [weak self] name in self?.close(name) }
+        strip.tabsView.onCollapse = { [weak self] name in self?.collapse(name) }
+        strip.tabsView.onExpand = { [weak self] name in self?.expandAndSelect(name) }
         strip.tabsView.onReorder = { [weak self] names in self?.reorder(names) }
         strip.tabsView.menuProvider = { [weak self] name in self?.menu(for: name) }
         strip.tabsView.onRequestRename = { [weak self] name in self?.beginRename(name) }
@@ -66,7 +81,8 @@ struct BrowserWindow {
         }
         if target.isTest {
             // Checks drive the strip with a notification instead of synthetic clicks on the screen:
-            // "select:Name", "rename:Name", "names".
+            // "select:Name", "rename:Name", "close:Name", "collapse:Name", "expand:Name" (a click on the icon),
+            // "hover:X" (the mouse over the strip at X points from its left edge, off it for a negative X), "names".
             DistributedNotificationCenter.default().addObserver(
                 forName: Notification.Name("com.max.google-chrome-profile-tabs.test"), object: nil, queue: .main
             ) { [weak self] note in
@@ -155,8 +171,11 @@ struct BrowserWindow {
         hotkeys.setEnabled(watcher.isFrontmost)
         guard watcher.isRunning else {
             attached = nil
+            openProfiles = []
+            closing.removeAll()
+            closeAsked.removeAll()
             strip.hide()
-            showTabs(open: [])
+            showTabs()
             return
         }
         if profiles.profiles.isEmpty {
@@ -164,6 +183,8 @@ struct BrowserWindow {
         }
         let windows = browserWindows()
         resolvePending(windows)
+        finishClosing(windows)
+        openProfiles = Set(windows.map(\.profile))
         let onScreen = onScreenWindowIDs()
         let usable = windows.filter { !$0.minimized && onScreen.contains($0.id) }
         let main = watcher.mainWindow().flatMap(AX.windowID)
@@ -177,7 +198,7 @@ struct BrowserWindow {
         } else {
             attached = usable.first
         }
-        showTabs(open: Set(windows.map(\.profile)))
+        showTabs()
         layout()
 
         let summary = "profiles \(profiles.profiles.count), browser windows \(windows.map { "\($0.id):\($0.profile)" }), "
@@ -244,9 +265,17 @@ struct BrowserWindow {
     }
 
     private func onScreenWindowIDs() -> Set<CGWindowID> {
+        windowIDs([.optionOnScreenOnly, .excludeDesktopElements])
+    }
+
+    /// The browser's windows on every desktop, minimized and full screen ones included.
+    private func allWindowIDs() -> Set<CGWindowID> {
+        windowIDs([.optionAll, .excludeDesktopElements])
+    }
+
+    private func windowIDs(_ options: CGWindowListOption) -> Set<CGWindowID> {
         guard let pid = watcher.app?.processIdentifier,
-              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]] else { return [] }
+              let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
         var ids = Set<CGWindowID>()
         for info in list where (info[kCGWindowOwnerPID as String] as? Int) == Int(pid) {
             if let number = info[kCGWindowNumber as String] as? Int {
@@ -258,24 +287,31 @@ struct BrowserWindow {
 
     // MARK: Strip
 
-    private func showTabs(open: Set<String>) {
+    private func showTabs() {
         let hidden = settings.hidden
-        let namesHidden = settings.namesHidden
-        visibleTabs = settings.arrange(profiles.profiles).filter { !hidden.contains($0.name) }
-        let tabs = visibleTabs.map { profile in
-            let title = title(for: profile.name)
-            let isOpen = open.contains(profile.name)
-            return TabsView.Tab(
-                key: profile.name,
-                title: title,
-                color: profile.color,
-                // The account photo gives a person away as well as a name, so it goes too while names are hidden.
-                picture: namesHidden ? nil : profile.picture,
-                isOpen: isOpen,
-                signature: "\(profile.signature)|\(title)|\(isOpen)"
-            )
-        }
-        strip.tabsView.show(tabs, active: attached?.profile, namesHidden: namesHidden)
+        let collapsed = settings.collapsed
+        let shown = settings.arrange(profiles.profiles).filter { !hidden.contains($0.name) }
+        visibleTabs = shown.filter { !collapsed.contains($0.name) }
+        strip.tabsView.show(
+            visibleTabs.map(tab(for:)),
+            icons: shown.filter { collapsed.contains($0.name) }.map(tab(for:)),
+            active: attached?.profile,
+            namesHidden: settings.namesHidden
+        )
+    }
+
+    private func tab(for profile: Profile) -> TabsView.Tab {
+        let title = title(for: profile.name)
+        let isOpen = openProfiles.contains(profile.name)
+        return TabsView.Tab(
+            key: profile.name,
+            title: title,
+            color: profile.color,
+            // The account photo gives a person away as well as a name, so it goes too while names are hidden.
+            picture: settings.namesHidden ? nil : profile.picture,
+            isOpen: isOpen,
+            signature: "\(profile.signature)|\(title)|\(isOpen)"
+        )
     }
 
     /// What the profile's tab says: the user's own name or Chrome's, and gibberish made of it while names
@@ -354,6 +390,8 @@ struct BrowserWindow {
     /// The profile's window takes the place of the current one and comes forward. No window: a new one opens.
     private func select(_ name: String) {
         guard watcher.isRunning else { return }
+        // The user wants the profile now: its windows coming into view from other desktops stay.
+        closing[name] = nil
         if let attached, attached.profile == name {
             focus(attached)
             return
@@ -390,7 +428,7 @@ struct BrowserWindow {
     /// and puts it where the current one is.
     private func open(_ name: String, into frame: CGRect?) {
         let known = Set(browserWindows().filter { $0.profile == name }.map(\.id))
-        pending = (name, frame, known, Date().addingTimeInterval(20))
+        pending = (name, frame, known, Date().addingTimeInterval(20), false)
         pendingFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
         pendingPoll?.invalidate()
         pendingPoll = repeating(every: 0.1) { [weak self] in self?.refresh() }
@@ -404,6 +442,11 @@ struct BrowserWindow {
         guard let pending else { return }
         if let window = windows.first(where: { $0.profile == pending.profile && !pending.known.contains($0.id) && !$0.minimized }) {
             stopPending()
+            if pending.discard {
+                closing[pending.profile, default: []].insert(window.id)
+                requestClose(window)
+                return
+            }
             if let frame = pending.frame {
                 AX.setFrame(window.element, frame)
             }
@@ -423,6 +466,73 @@ struct BrowserWindow {
         pending = nil
         pendingPoll?.invalidate()
         pendingPoll = nil
+    }
+
+    // MARK: Closing and collapsing
+
+    /// Closes every window of the profile, and its pages stop taking memory. The tab stays, paler.
+    private func close(_ name: String) {
+        closing[name] = allWindowIDs()
+        // A window still on its way for this profile is closed as soon as it shows up.
+        if pending?.profile == name {
+            pending?.discard = true
+        }
+        browserWindows().filter { $0.profile == name }.forEach(requestClose)
+        refresh()
+    }
+
+    /// Closes the profile and folds its tab into an icon at the right end of the strip.
+    private func collapse(_ name: String) {
+        settings.collapsed.insert(name)
+        close(name)
+    }
+
+    /// Presses the window's close button. A page may still ask whether to leave it.
+    private func requestClose(_ window: BrowserWindow) {
+        closeAsked[window.id] = Date()
+        if !AX.close(window.element) {
+            log.error("cannot close window \(window.id, privacy: .public) of profile \(window.profile, privacy: .public)")
+        }
+    }
+
+    /// The icon goes back into the row as a tab.
+    private func expand(_ name: String) {
+        settings.collapsed.remove(name)
+        closing[name] = nil
+        refresh()
+    }
+
+    /// A click on the icon: the tab comes back and its profile opens.
+    private func expandAndSelect(_ name: String) {
+        expand(name)
+        select(name)
+    }
+
+    /// Carries on closing profiles: a window of a closed profile that comes into view from another desktop
+    /// closes now. A profile that keeps a window after all stays open, and a collapsed one gets its tab back:
+    /// the window was opened after the close (from Chrome's menu, a link, before the strip started), or its
+    /// page asked to stay.
+    private func finishClosing(_ windows: [BrowserWindow]) {
+        let now = Date()
+        var collapsed = settings.collapsed
+        for window in windows {
+            let name = window.profile
+            if closing[name]?.contains(window.id) == true {
+                guard let asked = closeAsked[window.id] else {
+                    requestClose(window)
+                    continue
+                }
+                if now.timeIntervalSince(asked) <= Self.closeGrace {
+                    continue
+                }
+            }
+            closing[name] = nil
+            collapsed.remove(name)
+        }
+        if collapsed != settings.collapsed {
+            settings.collapsed = collapsed
+        }
+        closeAsked = closeAsked.filter { id, _ in closing.values.contains { $0.contains(id) } }
     }
 
     // MARK: Order and menu
@@ -483,6 +593,14 @@ struct BrowserWindow {
             select(name)
         case ("rename", let name?):
             beginRename(name)
+        case ("close", let name?):
+            close(name)
+        case ("collapse", let name?):
+            collapse(name)
+        case ("expand", let name?):
+            expandAndSelect(name)
+        case ("hover", let x?):
+            strip.tabsView.hover(atX: CGFloat(Double(x) ?? -1))
         case ("names", nil):
             toggleNamesHidden()
         default:
@@ -492,13 +610,22 @@ struct BrowserWindow {
 
     private func menu(for name: String?) -> NSMenu {
         let menu = NSMenu()
-        if let name {
+        if let name, settings.collapsed.contains(name) {
+            menu.addItem(MenuAction("Expand Tab") { [weak self] in self?.expand(name) })
+            menu.addItem(MenuAction("Hide Tab") { [weak self] in self?.setHidden(name, true) })
+            menu.addItem(.separator())
+        } else if let name {
             if !settings.namesHidden {
                 menu.addItem(MenuAction("Rename…") { [weak self] in self?.beginRename(name) })
                 if settings.customNames[name] != nil {
                     menu.addItem(MenuAction("Reset Name to “\(name)”") { [weak self] in self?.rename(name, to: "") })
                 }
             }
+            let isOpen = openProfiles.contains(name)
+            if isOpen {
+                menu.addItem(MenuAction("Close Profile") { [weak self] in self?.close(name) })
+            }
+            menu.addItem(MenuAction(isOpen ? "Close and Collapse to Icon" : "Collapse to Icon") { [weak self] in self?.collapse(name) })
             menu.addItem(MenuAction("Hide Tab") { [weak self] in self?.setHidden(name, true) })
             menu.addItem(.separator())
         }

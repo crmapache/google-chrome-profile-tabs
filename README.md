@@ -10,6 +10,8 @@ It works on macOS 14 or later and on Windows 10 and 11.
 
 - Ctrl+1 to Ctrl+9 on macOS and Alt+1 to Alt+9 on Windows switch to the tab with that number while a Chrome window is in front. Other apps keep these keys. Windows gets Alt because Chrome there uses Ctrl+1 to Ctrl+9 for its own tabs.
 - Tabs of profiles without an open window are paler.
+- A tab under the mouse shows two buttons. The cross closes every window of the profile, so its pages stop taking memory, and the tab stays in the row, paler. The minus closes the windows too and collapses the tab into a small icon at the right end of the row. The right-click menu has the same commands.
+- Hover a collapsed icon to see the profile's name. Click it to bring the tab back and open the profile. A collapsed profile that you open some other way, from Chrome's menu or a link, gets its tab back by itself. Collapsed profiles are not counted by the number shortcuts.
 - Drag a tab to change the order.
 - Double-click a tab, or right-click it and choose Rename, to give it your own name. Enter saves, Esc cancels, and an empty name brings back the profile's name.
 - The eye button on the right replaces every name with gibberish of the same length, for screen sharing. Click it again to get the names back. The setting survives a restart.

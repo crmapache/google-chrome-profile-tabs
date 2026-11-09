@@ -1,8 +1,10 @@
 import AppKit
 
 /// The row of profile tabs: equal width, like JetBrains project tabs. A click switches the profile, a double
-/// click renames the tab, dragging reorders, a right click opens the menu. On the right, a button hides the
-/// names for screen sharing.
+/// click renames the tab, dragging reorders, a right click opens the menu. A tab under the mouse shows two
+/// buttons: one closes the profile's windows, the other closes them too and folds the tab into an icon at the
+/// right end of the row. A click on the icon brings the tab back. On the far right, a button hides the names
+/// for screen sharing.
 @MainActor final class TabsView: NSView, NSTextFieldDelegate {
     struct Tab {
         /// The profile's name in Chrome: the tab is known by it whatever it says on it.
@@ -16,12 +18,24 @@ import AppKit
         let signature: String
     }
 
+    /// The buttons of the tab under the mouse.
+    enum TabButton {
+        case collapse
+        case close
+    }
+
+    /// What is under the mouse. Indexes are tab positions for tabs and their buttons, icon positions for icons.
     private enum Hover: Equatable {
         case tab(Int)
+        case button(Int, TabButton)
+        case icon(Int)
         case privacy
     }
 
     var onSelect: ((String) -> Void)?
+    var onClose: ((String) -> Void)?
+    var onCollapse: ((String) -> Void)?
+    var onExpand: ((String) -> Void)?
     var onReorder: (([String]) -> Void)?
     var onRequestRename: ((String) -> Void)?
     var onRename: ((String, String) -> Void)?
@@ -30,51 +44,92 @@ import AppKit
     var menuProvider: ((String?) -> NSMenu?)?
 
     private var tabs: [Tab] = []
+    /// Collapsed profiles, as icons between the tabs and the privacy button.
+    private var icons: [Tab] = []
     private var active: String?
     private var namesHidden = false
     private var hovered: Hover?
     private var press: (index: Int, x: CGFloat)?
-    private var pressedPrivacy = false
+    /// A button or an icon held down: it acts if the mouse is let go over it.
+    private var pressedControl: Hover?
+    /// What got the first click of a double click.
+    private var firstClick: Hover?
     /// The dragged tab: its index, where it was grabbed and where its left edge is now.
     private var drag: (index: Int, grab: CGFloat, left: CGFloat)?
     private var editor: NSTextField?
     private var editingKey: String?
+    private let tooltip = Tooltip()
+    /// After a click the tooltip waits until the mouse goes to something else, like the system's.
+    private var tooltipMuted = false
 
     private static let buttonWidth: CGFloat = 34
+    /// An icon's width, narrowing down to the smaller one when many profiles are collapsed.
+    private static let iconWidths: ClosedRange<CGFloat> = 20...30
+    /// The buttons of a tab: their size, the gap between them and their distance from the tab's right edge.
+    private static let tabButtonSize: CGFloat = 18
+    private static let tabButtonGap: CGFloat = 2
+    private static let tabButtonInset: CGFloat = 6
+    /// A narrower tab gets no buttons, they would leave no room for the name. Its menu has the same commands.
+    private static let tabButtonsMinWidth: CGFloat = 90
 
     override var isFlipped: Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    func show(_ tabs: [Tab], active: String?, namesHidden: Bool) {
+    func show(_ tabs: [Tab], icons: [Tab], active: String?, namesHidden: Bool) {
         // The state comes every second and rarely changes: no redraw without a change.
         let same = active == self.active
             && namesHidden == self.namesHidden
             && tabs.map(\.signature) == self.tabs.map(\.signature)
+            && icons.map(\.signature) == self.icons.map(\.signature)
         if same {
             return
         }
-        if drag != nil, tabs.map(\.key) != self.tabs.map(\.key) {
+        let sameKeys = tabs.map(\.key) == self.tabs.map(\.key) && icons.map(\.key) == self.icons.map(\.key)
+        if !sameKeys {
             drag = nil
             press = nil
+            pressedControl = nil
+            firstClick = nil
         }
         self.tabs = tabs
+        self.icons = icons
         self.active = active
         self.namesHidden = namesHidden
-        if case .tab(let index) = hovered, index >= tabs.count {
-            hovered = nil
+        // What is under the mouse may change with the tabs: a closed profile's tab loses its close button.
+        if hovered != nil, let window {
+            hovered = hover(at: convert(window.mouseLocationOutsideOfEventStream, from: nil))
         }
         // A field for a tab that is gone, or one that would show a real name while names are hidden, closes.
         if let editingKey, namesHidden || !tabs.contains(where: { $0.key == editingKey }) {
             endEditing(commit: false)
         }
         positionEditor()
+        updateTooltip()
         needsDisplay = true
+    }
+
+    func hideTooltip() {
+        tooltip.hide()
+    }
+
+    /// For checks: the mouse over the strip at this distance from its left edge, or off it if negative.
+    func hover(atX x: CGFloat) {
+        tooltipMuted = false
+        setHovered(x < 0 ? nil : hover(at: NSPoint(x: x, y: bounds.midY)))
     }
 
     // MARK: Geometry
 
-    private var tabsWidth: CGFloat { max(0, bounds.width - Self.buttonWidth) }
+    /// Icons take at most half of the row while there are tabs.
+    private var iconWidth: CGFloat {
+        let room = (bounds.width - Self.buttonWidth) * (tabs.isEmpty ? 1 : 0.5)
+        let width = icons.isEmpty ? Self.iconWidths.upperBound : room / CGFloat(icons.count)
+        return min(max(width, Self.iconWidths.lowerBound), Self.iconWidths.upperBound)
+    }
+
+    /// Where the icons start; the tabs share the room left of them.
+    private var tabsWidth: CGFloat { max(0, bounds.width - Self.buttonWidth - CGFloat(icons.count) * iconWidth) }
     private var slot: CGFloat { tabs.isEmpty ? 0 : tabsWidth / CGFloat(tabs.count) }
 
     // Everything is laid out on screen pixels, not points: when the window is resized the tabs and names move
@@ -85,23 +140,81 @@ import AppKit
         (value * scale).rounded() / scale
     }
 
-    /// The left edge of the slot for the tab at this position.
+    /// The left edge of the slot for the tab at this position. The last edge is where the icons start: the tabs,
+    /// the icons and the privacy button meet on the same pixels.
     private func edge(_ position: Int) -> CGFloat {
-        pixel(CGFloat(position) * slot)
+        position >= tabs.count ? pixel(tabsWidth) : pixel(CGFloat(position) * slot)
     }
 
     private func slotRect(_ position: Int) -> NSRect {
         NSRect(x: edge(position), y: 0, width: edge(position + 1) - edge(position), height: bounds.height)
     }
 
+    private func iconRect(_ index: Int) -> NSRect {
+        let left = pixel(tabsWidth + CGFloat(index) * iconWidth)
+        let right = pixel(tabsWidth + CGFloat(index + 1) * iconWidth)
+        return NSRect(x: left, y: 0, width: right - left, height: bounds.height)
+    }
+
     private var buttonRect: NSRect {
-        let left = edge(tabs.count)
+        let left = iconRect(icons.count).minX
         return NSRect(x: left, y: 0, width: bounds.width - left, height: bounds.height)
     }
 
     private func index(at point: NSPoint) -> Int? {
-        guard !tabs.isEmpty, bounds.contains(point), point.x < tabsWidth else { return nil }
+        guard !tabs.isEmpty, bounds.contains(point), point.x < edge(tabs.count) else { return nil }
         return min(tabs.count - 1, max(0, Int(point.x / slot)))
+    }
+
+    private func iconIndex(at point: NSPoint) -> Int? {
+        guard bounds.contains(point) else { return nil }
+        return icons.indices.first { iconRect($0).contains(point) }
+    }
+
+    /// A tab's buttons from right to left. Close only for a profile with windows: there is nothing else to close.
+    private func tabButtons(_ index: Int, in rect: NSRect) -> [(kind: TabButton, rect: NSRect)] {
+        guard rect.width >= Self.tabButtonsMinWidth else { return [] }
+        let kinds: [TabButton] = tabs[index].isOpen ? [.close, .collapse] : [.collapse]
+        let size = Self.tabButtonSize
+        let top = pixel(rect.midY - size / 2)
+        var right = rect.maxX - Self.tabButtonInset
+        return kinds.map { kind in
+            let frame = NSRect(x: pixel(right - size), y: top, width: size, height: size)
+            right = frame.minX - Self.tabButtonGap
+            return (kind, frame)
+        }
+    }
+
+    private var hoveredTab: Int? {
+        switch hovered {
+        case .tab(let index)?, .button(let index, _)?:
+            return index
+        default:
+            return nil
+        }
+    }
+
+    /// The tab showing its buttons: the one under the mouse, unless a tab is being dragged or renamed.
+    private var buttonsTab: Int? {
+        guard drag == nil, let index = hoveredTab, index < tabs.count, tabs[index].key != editingKey else { return nil }
+        return index
+    }
+
+    private func hover(at point: NSPoint) -> Hover? {
+        guard bounds.contains(point) else { return nil }
+        if buttonRect.contains(point) {
+            return .privacy
+        }
+        if let icon = iconIndex(at: point) {
+            return .icon(icon)
+        }
+        guard let index = index(at: point) else { return nil }
+        // The mouse over a tab makes it show its buttons, so they count as soon as the mouse is on the tab.
+        if drag == nil, tabs[index].key != editingKey,
+           let button = tabButtons(index, in: slotRect(index)).first(where: { $0.rect.contains(point) }) {
+            return .button(index, button.kind)
+        }
+        return .tab(index)
     }
 
     private func location(_ event: NSEvent) -> NSPoint {
@@ -126,7 +239,11 @@ import AppKit
 
     override func mouseMoved(with event: NSEvent) {
         let point = location(event)
-        setHovered(buttonRect.contains(point) ? .privacy : index(at: point).map(Hover.tab))
+        let hover = hover(at: point)
+        if hover != hovered {
+            tooltipMuted = false
+        }
+        setHovered(hover)
         if let editor, editor.frame.contains(point) {
             NSCursor.iBeam.set()
         } else {
@@ -144,15 +261,18 @@ import AppKit
     private func setHovered(_ hover: Hover?) {
         guard hover != hovered else { return }
         hovered = hover
+        updateTooltip()
         needsDisplay = true
     }
 
-    /// A hand over the tabs and the button, a closed hand while a tab is dragged.
+    /// A hand over the tabs and the buttons, a closed hand while a tab is dragged.
     private func updateCursor() {
         (drag == nil ? NSCursor.pointingHand : NSCursor.closedHand).set()
     }
 
     override func mouseDown(with event: NSEvent) {
+        tooltipMuted = true
+        tooltip.hide()
         if event.modifierFlags.contains(.control) {
             if let menu = menu(for: event) {
                 NSMenu.popUpContextMenu(menu, with: event, for: self)
@@ -160,12 +280,24 @@ import AppKit
             return
         }
         let point = location(event)
-        if buttonRect.contains(point) {
-            pressedPrivacy = true
+        let target = hover(at: point)
+        // The second click of a double click counts only on what got the first: the first may have changed
+        // the row, and a tab may now be where an icon or a close button was.
+        if event.clickCount > 1, target != firstClick {
             return
         }
-        guard let index = index(at: point) else { return }
-        press = (index, point.x)
+        if event.clickCount == 1 {
+            firstClick = target
+        }
+        switch target {
+        case .tab(let index)?:
+            press = (index, point.x)
+        case let control?:
+            pressedControl = control
+            needsDisplay = true
+        case nil:
+            break
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -187,7 +319,9 @@ import AppKit
         defer {
             press = nil
             drag = nil
-            pressedPrivacy = false
+            pressedControl = nil
+            // A dropped tab, a closed profile or a collapsed one: something else may be under the mouse now.
+            setHovered(hover(at: point))
             needsDisplay = true
             if bounds.contains(point) {
                 updateCursor()
@@ -195,9 +329,9 @@ import AppKit
                 NSCursor.arrow.set()
             }
         }
-        if pressedPrivacy {
-            if buttonRect.contains(point) {
-                onTogglePrivacy?()
+        if let control = pressedControl {
+            if hover(at: point) == control {
+                act(control)
             }
             return
         }
@@ -219,8 +353,25 @@ import AppKit
         }
     }
 
+    private func act(_ control: Hover) {
+        switch control {
+        case .privacy:
+            onTogglePrivacy?()
+        case .button(let index, .close):
+            onClose?(tabs[index].key)
+        case .button(let index, .collapse):
+            onCollapse?(tabs[index].key)
+        case .icon(let index):
+            onExpand?(icons[index].key)
+        case .tab:
+            break
+        }
+    }
+
     override func menu(for event: NSEvent) -> NSMenu? {
-        menuProvider?(index(at: location(event)).map { tabs[$0].key })
+        tooltip.hide()
+        let point = location(event)
+        return menuProvider?(iconIndex(at: point).map { icons[$0].key } ?? index(at: point).map { tabs[$0].key })
     }
 
     /// The order of the tabs if the dragged one were dropped now.
@@ -230,6 +381,36 @@ import AppKit
         order.remove(at: drag.index)
         order.insert(drag.index, at: target)
         return order
+    }
+
+    // MARK: Tooltip
+
+    /// The icons show the profile's name, the buttons what they do. Tabs show their names already.
+    private func updateTooltip() {
+        guard !tooltipMuted, press == nil, pressedControl == nil, let window, let hovered else {
+            tooltip.hide()
+            return
+        }
+        let content: (text: String, rect: NSRect)?
+        switch hovered {
+        case .icon(let index):
+            content = (icons[index].title, iconRect(index))
+        case .button(let index, let kind):
+            let rect = tabButtons(index, in: slotRect(index)).first { $0.kind == kind }?.rect ?? slotRect(index)
+            switch kind {
+            case .close:
+                content = ("Close profile", rect)
+            case .collapse:
+                content = (tabs[index].isOpen ? "Close and collapse to icon" : "Collapse to icon", rect)
+            }
+        case .tab, .privacy:
+            content = nil
+        }
+        guard let content else {
+            tooltip.hide()
+            return
+        }
+        tooltip.show(content.text, below: window.convertToScreen(convert(content.rect, to: nil)))
     }
 
     // MARK: Renaming
@@ -258,6 +439,7 @@ import AppKit
         (window as? StripPanel)?.startTyping()
         window?.makeFirstResponder(field)
         field.currentEditor()?.selectAll(nil)
+        updateTooltip()
         needsDisplay = true
     }
 
@@ -307,6 +489,8 @@ import AppKit
 
     // MARK: Drawing
 
+    private var dark: Bool { effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
+
     override func draw(_ dirtyRect: NSRect) {
         let shape = NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8)
         Palette.background.setFill()
@@ -319,7 +503,9 @@ import AppKit
             drawTab(index, in: slotRect(position))
         }
         drawSeparators(order: order)
-        drawPrivacyButton(nextToActive: order.last.map { tabs[$0].key == active } ?? false)
+        let lastTabActive = order.last.map { tabs[$0].key == active } ?? false
+        drawIcons(afterActive: lastTabActive)
+        drawPrivacyButton(nextToActive: icons.isEmpty ? lastTabActive : icons.last?.key == active)
         if let drag {
             drawTab(drag.index, in: NSRect(x: pixel(drag.left), y: 0, width: pixel(slot), height: bounds.height), lifted: true)
         }
@@ -332,31 +518,63 @@ import AppKit
     }
 
     private func drawSeparators(order: [Int]) {
-        Palette.separator.setFill()
         for position in order.indices.dropFirst() {
             let left = order[position - 1]
             let right = order[position]
             // No line next to the selected or the dragged tab: their fill already sets them apart.
             let quiet = [left, right].contains { tabs[$0].key == active || $0 == drag?.index }
             if quiet { continue }
-            NSRect(x: edge(position), y: 7, width: 1 / scale, height: bounds.height - 14).fill()
+            separator(at: edge(position))
+        }
+    }
+
+    private func separator(at x: CGFloat) {
+        Palette.separator.setFill()
+        NSRect(x: x, y: 7, width: 1 / scale, height: bounds.height - 14).fill()
+    }
+
+    /// Collapsed profiles: the avatar alone, paler while the profile has no window, like a tab.
+    private func drawIcons(afterActive: Bool) {
+        guard !icons.isEmpty else { return }
+        for (index, icon) in icons.enumerated() {
+            let rect = iconRect(index)
+            let isActive = icon.key == active
+            let lit = hovered == .icon(index) || pressedControl == .icon(index)
+            if isActive {
+                Palette.active.setFill()
+                rect.fill()
+                Palette.accent(icon.color, dark: dark).setFill()
+                NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 2).fill()
+            } else if lit {
+                Palette.hover.setFill()
+                rect.fill()
+            }
+            let avatar: CGFloat = 16
+            let frame = NSRect(x: pixel(rect.midX - avatar / 2), y: pixel(rect.midY - avatar / 2), width: avatar, height: avatar)
+            drawAvatar(icon, in: frame, alpha: icon.isOpen || isActive || lit ? 1 : 0.45)
+        }
+        if !afterActive && !tabs.isEmpty {
+            separator(at: iconRect(0).minX)
         }
     }
 
     private func drawPrivacyButton(nextToActive: Bool) {
         let rect = buttonRect
-        if hovered == .privacy || pressedPrivacy {
+        if hovered == .privacy || pressedControl == .privacy {
             Palette.hover.setFill()
             rect.fill()
         }
-        if !nextToActive && !tabs.isEmpty {
-            Palette.separator.setFill()
-            NSRect(x: rect.minX, y: 7, width: 1 / scale, height: bounds.height - 14).fill()
+        if !nextToActive && !(tabs.isEmpty && icons.isEmpty) {
+            separator(at: rect.minX)
         }
         let color = namesHidden ? Palette.activeText : Palette.text.withAlphaComponent(0.65)
-        let configuration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        drawSymbol(namesHidden ? "eye.slash" : "eye", pointSize: 12, weight: .medium, color: color, in: rect)
+    }
+
+    private func drawSymbol(_ name: String, pointSize: CGFloat, weight: NSFont.Weight, color: NSColor, in rect: NSRect) {
+        let configuration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
             .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
-        guard let image = NSImage(systemSymbolName: namesHidden ? "eye.slash" : "eye", accessibilityDescription: nil)?
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
             .withSymbolConfiguration(configuration) else { return }
         let size = image.size
         image.draw(
@@ -372,12 +590,11 @@ import AppKit
     private func drawTab(_ index: Int, in rect: NSRect, lifted: Bool = false) {
         let tab = tabs[index]
         let isActive = tab.key == active
-        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 
         if isActive || lifted || tab.key == editingKey {
             Palette.active.setFill()
             rect.fill()
-        } else if hovered == .tab(index) && drag == nil {
+        } else if hoveredTab == index && drag == nil {
             Palette.hover.setFill()
             rect.fill()
         }
@@ -389,6 +606,9 @@ import AppKit
             return
         }
 
+        let buttons = !lifted && index == buttonsTab ? tabButtons(index, in: rect) : []
+        // The name keeps clear of the buttons on both sides, so it stays centered when they show up.
+        let margin = buttons.last.map { rect.maxX - $0.rect.minX + 4 } ?? 12
         let alpha: CGFloat = tab.isOpen || isActive ? 1 : 0.45
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineBreakMode = .byTruncatingTail
@@ -401,7 +621,7 @@ import AppKit
         let size = name.size(withAttributes: attributes)
         let avatar: CGFloat = 16
         let spacing: CGFloat = 7
-        let textWidth = min(ceil(size.width), max(0, rect.width - 24 - avatar - spacing))
+        let textWidth = min(ceil(size.width), max(0, rect.width - 2 * margin - avatar - spacing))
         var x = pixel(rect.midX - (avatar + spacing + textWidth) / 2)
 
         drawAvatar(tab, in: NSRect(x: x, y: pixel(rect.midY - avatar / 2), width: avatar, height: avatar), alpha: alpha)
@@ -411,6 +631,16 @@ import AppKit
             options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
             attributes: attributes
         )
+
+        let ink = isActive ? Palette.activeText : Palette.text
+        for button in buttons {
+            let pressed = pressedControl == .button(index, button.kind)
+            if pressed || hovered == .button(index, button.kind) {
+                ink.withAlphaComponent(pressed ? 0.24 : 0.14).setFill()
+                NSBezierPath(roundedRect: button.rect, xRadius: 4, yRadius: 4).fill()
+            }
+            drawSymbol(button.kind == .close ? "xmark" : "minus", pointSize: 9, weight: .bold, color: ink, in: button.rect)
+        }
     }
 
     private func drawAvatar(_ tab: Tab, in rect: NSRect, alpha: CGFloat) {
@@ -444,6 +674,8 @@ enum Palette {
     static let border = dynamic(dark: 0x2B2D30, light: 0xD3D5DB)
     static let text = dynamic(dark: 0xC1C4CA, light: 0x4E5157)
     static let activeText = dynamic(dark: 0xF0F1F3, light: 0x111214)
+    static let tooltip = dynamic(dark: 0x2B2D30, light: 0xFFFFFF)
+    static let tooltipBorder = dynamic(dark: 0x43454A, light: 0xC9CCD2)
 
     private static func dynamic(dark: UInt32, light: UInt32) -> NSColor {
         NSColor(name: nil) { appearance in

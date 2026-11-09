@@ -110,6 +110,9 @@ public:
     void setOrder(const std::vector<std::wstring>& dirs);
     std::set<std::wstring> hidden() const;
     void setHidden(const std::set<std::wstring>& dirs);
+    // Profiles closed and folded into icons at the right end of the strip.
+    std::set<std::wstring> collapsed() const;
+    void setCollapsed(const std::set<std::wstring>& dirs);
     std::map<std::wstring, std::wstring> customNames() const;
     void setCustomName(const std::wstring& dir, const std::wstring& name);  // empty name removes it
     bool namesHidden() const;

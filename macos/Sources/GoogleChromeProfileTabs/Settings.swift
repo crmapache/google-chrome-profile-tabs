@@ -21,6 +21,12 @@ import ServiceManagement
         set { defaults.set(newValue.sorted(), forKey: "hidden") }
     }
 
+    /// Profiles closed and folded into icons at the right end of the strip.
+    var collapsed: Set<String> {
+        get { Set(defaults.stringArray(forKey: "collapsed") ?? []) }
+        set { defaults.set(newValue.sorted(), forKey: "collapsed") }
+    }
+
     /// Own tab names: profile name in Chrome -> what the tab says.
     var customNames: [String: String] {
         get { defaults.dictionary(forKey: "customNames") as? [String: String] ?? [:] }
@@ -51,11 +57,11 @@ import ServiceManagement
         return saved.compactMap { byName[$0] } + profiles.filter { !saved.contains($0.name) }
     }
 
-    /// A new order of the visible tabs. Hidden profiles keep their places among the rest.
+    /// A new order of the tabs in the row. Hidden and collapsed profiles keep their places among the rest.
     func reorder(visible: [String], among profiles: [Profile]) {
         var next = visible.makeIterator()
-        let hidden = hidden
-        order = arrange(profiles).map { hidden.contains($0.name) ? $0.name : next.next() ?? $0.name }
+        let shown = Set(visible)
+        order = arrange(profiles).map { shown.contains($0.name) ? next.next() ?? $0.name : $0.name }
     }
 }
 

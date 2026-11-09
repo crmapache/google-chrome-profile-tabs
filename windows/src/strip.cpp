@@ -1,8 +1,10 @@
-// The strip window: Direct2D drawing, mouse, renaming in place and the button that hides the names.
+// The strip window: Direct2D drawing, mouse, renaming in place, the buttons that close and collapse a
+// profile, the icons of collapsed profiles and the button that hides the names.
 #include "strip.h"
 
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <uxtheme.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -96,12 +98,14 @@ bool Strip::create(HINSTANCE instance) {
     dwrite_->CreateTextFormat(text, nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12, L"", &semibold_);
     dwrite_->CreateTextFormat(text, nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 9.5f, L"", &initial_);
     dwrite_->CreateTextFormat(icons, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13, L"", &glyph_);
-    for (IDWriteTextFormat* format : {regular_, semibold_, initial_, glyph_}) {
+    dwrite_->CreateTextFormat(icons, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10, L"", &smallGlyph_);
+    for (IDWriteTextFormat* format : {regular_, semibold_, initial_, glyph_, smallGlyph_}) {
         format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
     initial_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     glyph_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    smallGlyph_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     dwrite_->CreateEllipsisTrimmingSign(regular_, &ellipsis_);
 
     WNDCLASSEXW windowClass{sizeof(windowClass)};
@@ -116,6 +120,11 @@ bool Strip::create(HINSTANCE instance) {
                             WS_POPUP | WS_CLIPCHILDREN, 0, 0, 400, 30, nullptr, nullptr, instance, this);
     if (!hwnd_) return false;
     DwmSetWindowAttribute(hwnd_, kCornerPreference, &kRoundCorners, sizeof(kRoundCorners));
+    // The tooltip of the icons and the tab buttons. Always-tip: the strip's program is never the active one.
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES};
+    InitCommonControlsEx(&controls);
+    tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT,
+                               CW_USEDEFAULT, CW_USEDEFAULT, hwnd_, nullptr, instance, nullptr);
     refreshTheme();
     return true;
 }
@@ -125,6 +134,7 @@ void Strip::refreshTheme() {
     const Palette& palette = dark_ ? kDark : kLight;
     COLORREF border = colorRef(palette.border);
     DwmSetWindowAttribute(hwnd_, kBorderColor, &border, sizeof(border));
+    if (tooltip_) SetWindowTheme(tooltip_, dark_ ? L"DarkMode_Explorer" : nullptr, nullptr);
     if (editBrush_) DeleteObject(editBrush_);
     editBrush_ = CreateSolidBrush(colorRef(palette.active));
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -138,27 +148,39 @@ int Strip::reserve(UINT dpi) { return heightPixels(dpi) + gapPixels(dpi); }
 
 // ---------------------------------------------------------------- state from the controller
 
-void Strip::show(const std::vector<Tab>& tabs, const std::wstring& active, bool namesHidden) {
+void Strip::show(const std::vector<Tab>& tabs, const std::vector<Tab>& icons, const std::wstring& active, bool namesHidden) {
+    auto same = [](const std::vector<Tab>& a, const std::vector<Tab>& b, std::wstring Tab::*field) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); i++) {
+            if (a[i].*field != b[i].*field) return false;
+        }
+        return true;
+    };
     // The state comes every second and rarely changes: no redraw without a change.
-    bool same = active == active_ && namesHidden == namesHidden_ && tabs.size() == tabs_.size();
-    for (size_t i = 0; same && i < tabs.size(); i++) same = tabs[i].signature == tabs_[i].signature;
-    if (same) return;
-    bool sameKeys = tabs.size() == tabs_.size();
-    for (size_t i = 0; sameKeys && i < tabs.size(); i++) sameKeys = tabs[i].key == tabs_[i].key;
-    if (dragging_ && !sameKeys) {
+    if (active == active_ && namesHidden == namesHidden_ && same(tabs, tabs_, &Tab::signature) && same(icons, icons_, &Tab::signature)) return;
+    if (!same(tabs, tabs_, &Tab::key) || !same(icons, icons_, &Tab::key)) {
         dragging_ = false;
         pressIndex_ = -1;
+        pressed_ = firstClick_ = Hit{};
     }
     tabs_ = tabs;
+    icons_ = icons;
     active_ = active;
     namesHidden_ = namesHidden;
-    if (hoverKind_ == HoverKind::Tab && hoverIndex_ >= static_cast<int>(tabs_.size())) hoverKind_ = HoverKind::None;
+    // What is under the mouse may change with the tabs: a closed profile's tab loses its close button.
+    if (hover_.kind != HoverKind::None) hover_ = hitAt(cursorInDips());
     // A field for a tab that is gone, or one that would show a real name while names are hidden, closes.
     if (edit_ && (namesHidden_ || std::none_of(tabs_.begin(), tabs_.end(), [&](const Tab& tab) { return tab.key == editingKey_; }))) {
         endEditing(false);
     }
     positionEditor();
+    updateTooltip();
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void Strip::hoverAt(float x) {
+    tooltipMuted_ = false;
+    setHover(x < 0 ? Hit{} : hitAt(D2D1::Point2F(x, kHeight / 2)));
 }
 
 void Strip::place(const RECT& frame, HWND browser, UINT dpi, bool live) {
@@ -181,11 +203,15 @@ void Strip::place(const RECT& frame, HWND browser, UINT dpi, bool live) {
     GetWindowRect(hwnd_, &current);
     if (current.left == x && current.top == y && current.right - current.left == w && current.bottom - current.top == height) {
         flags |= SWP_NOMOVE | SWP_NOSIZE;
+    } else if (tooltip_) {
+        // A tooltip would be left hanging where the strip was.
+        SendMessageW(tooltip_, TTM_POP, 0, 0);
     }
     SetWindowPos(hwnd_, after, x, y, w, height, flags);
 }
 
 void Strip::hide() {
+    if (tooltip_) SendMessageW(tooltip_, TTM_POP, 0, 0);
     if (isShown()) ShowWindow(hwnd_, SW_HIDE);
 }
 
@@ -206,26 +232,93 @@ float Strip::width() const {
     return client.right / scale();
 }
 
-float Strip::tabsWidth() const { return std::max(0.f, width() - kButton); }
+// Icons take at most half of the row while there are tabs.
+float Strip::iconWidth() const {
+    if (icons_.empty()) return kIconMax;
+    float room = (width() - kButton) * (tabs_.empty() ? 1.f : 0.5f);
+    return std::clamp(room / icons_.size(), kIconMin, kIconMax);
+}
+
+// Where the icons start; the tabs share the room left of them.
+float Strip::tabsWidth() const { return std::max(0.f, width() - kButton - icons_.size() * iconWidth()); }
 float Strip::slot() const { return tabs_.empty() ? 0 : tabsWidth() / tabs_.size(); }
 
 // Everything is laid out on screen pixels, not DIPs: when the window is resized the tabs and names
 // move a pixel at a time instead of jumping, and edges do not shimmer.
 float Strip::snap(float value) const { return std::round(value * scale()) / scale(); }
 
-float Strip::edge(int position) const { return snap(position * slot()); }
+// The last edge is where the icons start: the tabs, the icons and the eye button meet on the same pixels.
+float Strip::edge(int position) const {
+    return position >= static_cast<int>(tabs_.size()) ? snap(tabsWidth()) : snap(position * slot());
+}
 
 D2D1_RECT_F Strip::slotRect(int position) const {
     return D2D1::RectF(edge(position), 0, edge(position + 1), kHeight);
 }
 
+D2D1_RECT_F Strip::iconRect(int index) const {
+    float left = tabsWidth(), icon = iconWidth();
+    return D2D1::RectF(snap(left + index * icon), 0, snap(left + (index + 1) * icon), kHeight);
+}
+
 D2D1_RECT_F Strip::buttonRect() const {
-    return D2D1::RectF(edge(static_cast<int>(tabs_.size())), 0, width(), kHeight);
+    return D2D1::RectF(iconRect(static_cast<int>(icons_.size())).left, 0, width(), kHeight);
 }
 
 int Strip::indexAt(float x, float y) const {
-    if (tabs_.empty() || x < 0 || y < 0 || x >= tabsWidth() || y > kHeight) return -1;
+    if (tabs_.empty() || x < 0 || y < 0 || x >= edge(static_cast<int>(tabs_.size())) || y > kHeight) return -1;
     return std::clamp(static_cast<int>(x / slot()), 0, static_cast<int>(tabs_.size()) - 1);
+}
+
+int Strip::iconAt(float x) const {
+    for (int index = 0; index < static_cast<int>(icons_.size()); index++) {
+        D2D1_RECT_F rect = iconRect(index);
+        if (x >= rect.left && x < rect.right) return index;
+    }
+    return -1;
+}
+
+// A tab's buttons from right to left. Close only for a profile with windows: there is nothing else to close.
+std::vector<Strip::TabButton> Strip::tabButtons(int index, D2D1_RECT_F rect) const {
+    std::vector<TabButton> buttons;
+    if (rect.right - rect.left < kTabButtonsMinWidth) return buttons;
+    float top = snap((rect.top + rect.bottom) / 2 - kTabButton / 2), right = rect.right - kTabButtonInset;
+    for (HoverKind kind : {HoverKind::Close, HoverKind::Collapse}) {
+        if (kind == HoverKind::Close && !tabs_[index].isOpen) continue;
+        float left = snap(right - kTabButton);
+        buttons.push_back({kind, D2D1::RectF(left, top, left + kTabButton, top + kTabButton)});
+        right = left - kTabButtonGap;
+    }
+    return buttons;
+}
+
+int Strip::hoveredTab() const {
+    bool onTab = hover_.kind == HoverKind::Tab || hover_.kind == HoverKind::Close || hover_.kind == HoverKind::Collapse;
+    return onTab && hover_.index < static_cast<int>(tabs_.size()) ? hover_.index : -1;
+}
+
+// The tab showing its buttons: the one under the mouse, unless a tab is being dragged or renamed.
+int Strip::buttonsTab() const {
+    int index = hoveredTab();
+    if (dragging_ || index < 0 || (edit_ && tabs_[index].key == editingKey_)) return -1;
+    return index;
+}
+
+Strip::Hit Strip::hitAt(D2D1_POINT_2F point) const {
+    if (point.x < 0 || point.y < 0 || point.x >= width() || point.y > kHeight) return {};
+    if (point.x >= buttonRect().left) return {HoverKind::Privacy, -1};
+    int icon = iconAt(point.x);
+    if (icon >= 0) return {HoverKind::Icon, icon};
+    int index = indexAt(point.x, point.y);
+    if (index < 0) return {};
+    // The mouse over a tab makes it show its buttons, so they count as soon as the mouse is on the tab.
+    if (!dragging_ && !(edit_ && tabs_[index].key == editingKey_)) {
+        for (const auto& button : tabButtons(index, slotRect(index))) {
+            const D2D1_RECT_F& rect = button.rect;
+            if (point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom) return {button.kind, index};
+        }
+    }
+    return {HoverKind::Tab, index};
 }
 
 // The order of the tabs if the dragged one were dropped now.
@@ -292,7 +385,9 @@ void Strip::drawContent() {
         if (!quiet) canvas_->FillRectangle(D2D1::RectF(edge(position), 7, edge(position) + 1 / scale(), kHeight - 7), line);
     }
     release(line);
-    drawPrivacyButton(!order.empty() && tabs_[order.back()].key == active_);
+    bool lastTabActive = !order.empty() && tabs_[order.back()].key == active_;
+    drawIcons(lastTabActive);
+    drawPrivacyButton(icons_.empty() ? lastTabActive : icons_.back().key == active_);
     if (dragging_) {
         float left = snap(dragLeft_);
         drawTab(dragIndex_, D2D1::RectF(left, 0, left + snap(slot()), kHeight), true);
@@ -346,7 +441,7 @@ void Strip::drawTab(int index, D2D1_RECT_F rect, bool lifted) {
     canvas_->CreateSolidColorBrush(color(palette.active), &brush);
     if (isActive || lifted || editing) {
         canvas_->FillRectangle(rect, brush);
-    } else if (hoverKind_ == HoverKind::Tab && hoverIndex_ == index && !dragging_) {
+    } else if (hoveredTab() == index && !dragging_) {
         brush->SetColor(color(palette.hover));
         canvas_->FillRectangle(rect, brush);
     }
@@ -359,10 +454,13 @@ void Strip::drawTab(int index, D2D1_RECT_F rect, bool lifted) {
         return;
     }
 
+    std::vector<TabButton> buttons = !lifted && index == buttonsTab() ? tabButtons(index, rect) : std::vector<TabButton>();
+    // The name keeps clear of the buttons on both sides, so it stays centered when they show up.
+    float margin = buttons.empty() ? 12 : rect.right - buttons.back().rect.left + 4;
     float alpha = tab.isOpen || isActive ? 1.f : 0.45f;
     IDWriteTextFormat* format = isActive ? semibold_ : regular_;
     const float avatar = 16, spacing = 7;
-    float available = std::max(0.f, (rect.right - rect.left) - 24 - avatar - spacing);
+    float available = std::max(0.f, (rect.right - rect.left) - 2 * margin - avatar - spacing);
     IDWriteTextLayout* measure = nullptr;
     dwrite_->CreateTextLayout(tab.title.c_str(), static_cast<UINT32>(tab.title.size()), format, 10000, kHeight, &measure);
     DWRITE_TEXT_METRICS metrics{};
@@ -382,6 +480,19 @@ void Strip::drawTab(int index, D2D1_RECT_F rect, bool lifted) {
         brush->SetColor(color(isActive ? palette.activeText : palette.text, alpha));
         canvas_->DrawTextLayout(D2D1::Point2F(x, 0), layout, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
         release(layout);
+    }
+    uint32_t ink = isActive ? palette.activeText : palette.text;
+    for (const auto& button : buttons) {
+        Hit self{button.kind, index};
+        bool pressed = pressed_ == self;
+        if (pressed || hover_ == self) {
+            brush->SetColor(color(ink, pressed ? 0.24f : 0.14f));
+            canvas_->FillRoundedRectangle(D2D1::RoundedRect(button.rect, 4, 4), brush);
+        }
+        // ChromeClose and ChromeMinimize of Segoe Fluent Icons / MDL2 Assets.
+        const wchar_t* glyph = button.kind == HoverKind::Close ? L"\xE8BB" : L"\xE921";
+        brush->SetColor(color(ink));
+        canvas_->DrawText(glyph, 1, smallGlyph_, button.rect, brush);
     }
     release(brush);
 }
@@ -438,13 +549,46 @@ void Strip::drawAvatar(const Tab& tab, D2D1_RECT_F rect, float alpha) {
     release(brush);
 }
 
+// Collapsed profiles: the avatar alone, paler while the profile has no window, like a tab.
+void Strip::drawIcons(bool afterActive) {
+    if (icons_.empty()) return;
+    const Palette& palette = dark_ ? kDark : kLight;
+    ID2D1SolidColorBrush* brush = nullptr;
+    canvas_->CreateSolidColorBrush(color(palette.active), &brush);
+    for (int index = 0; index < static_cast<int>(icons_.size()); index++) {
+        const Tab& icon = icons_[index];
+        D2D1_RECT_F rect = iconRect(index);
+        bool isActive = icon.key == active_;
+        Hit self{HoverKind::Icon, index};
+        bool lit = hover_ == self || pressed_ == self;
+        if (isActive) {
+            brush->SetColor(color(palette.active));
+            canvas_->FillRectangle(rect, brush);
+            brush->SetColor(accent(icon.color, dark_));
+            canvas_->FillRectangle(D2D1::RectF(rect.left, rect.bottom - 2, rect.right, rect.bottom), brush);
+        } else if (lit) {
+            brush->SetColor(color(palette.hover));
+            canvas_->FillRectangle(rect, brush);
+        }
+        const float avatar = 16;
+        float x = snap((rect.left + rect.right) / 2 - avatar / 2), y = snap((rect.top + rect.bottom) / 2 - avatar / 2);
+        drawAvatar(icon, D2D1::RectF(x, y, x + avatar, y + avatar), icon.isOpen || isActive || lit ? 1.f : 0.45f);
+    }
+    if (!afterActive && !tabs_.empty()) {
+        float left = iconRect(0).left;
+        brush->SetColor(color(palette.separator));
+        canvas_->FillRectangle(D2D1::RectF(left, 7, left + 1 / scale(), kHeight - 7), brush);
+    }
+    release(brush);
+}
+
 void Strip::drawPrivacyButton(bool nextToActive) {
     const Palette& palette = dark_ ? kDark : kLight;
     D2D1_RECT_F rect = buttonRect();
     ID2D1SolidColorBrush* brush = nullptr;
     canvas_->CreateSolidColorBrush(color(palette.hover), &brush);
-    if (hoverKind_ == HoverKind::Privacy || pressedPrivacy_) canvas_->FillRectangle(rect, brush);
-    if (!nextToActive && !tabs_.empty()) {
+    if (hover_.kind == HoverKind::Privacy || pressed_.kind == HoverKind::Privacy) canvas_->FillRectangle(rect, brush);
+    if (!nextToActive && !(tabs_.empty() && icons_.empty())) {
         brush->SetColor(color(palette.separator));
         canvas_->FillRectangle(D2D1::RectF(rect.left, 7, rect.left + 1 / scale(), kHeight - 7), brush);
     }
@@ -545,20 +689,23 @@ void Strip::dragTo(float x) {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-// The end of a press, wherever the button was let go: a click, a double click, a drop or the eye button.
+// The end of a press, wherever the button was let go: a click, a double click, a drop, a tab button, an
+// icon or the eye button.
 void Strip::finishPress(D2D1_POINT_2F point) {
     KillTimer(hwnd_, kPressTimer);
-    bool privacy = pressedPrivacy_, wasDragging = dragging_, twice = doubleClick_;
+    Hit control = pressed_;
+    bool wasDragging = dragging_, twice = doubleClick_;
     int pressed = pressIndex_;
     std::vector<int> order = dropOrder();
-    logLine(L"mouse up x=%.1f pressed=%d privacy=%d dragging=%d", point.x, pressed, privacy, wasDragging);
-    pressedPrivacy_ = dragging_ = doubleClick_ = false;
+    logLine(L"mouse up x=%.1f pressed=%d control=%d dragging=%d", point.x, pressed, static_cast<int>(control.kind), wasDragging);
+    pressed_ = Hit{};
+    dragging_ = doubleClick_ = false;
     pressIndex_ = -1;
     // Released only now: losing the capture cancels a press, and this one is already taken.
     if (GetCapture() == hwnd_) ReleaseCapture();
     InvalidateRect(hwnd_, nullptr, FALSE);
-    if (privacy) {
-        if (point.x >= buttonRect().left && point.y >= 0 && point.y <= kHeight && onTogglePrivacy) onTogglePrivacy();
+    if (control.kind != HoverKind::None) {
+        if (hitAt(point) == control) act(control);
         return;
     }
     if (wasDragging) {
@@ -574,6 +721,7 @@ void Strip::finishPress(D2D1_POINT_2F point) {
             tabs_ = reordered;
             if (onReorder) onReorder(keys);
         }
+        setHover(hitAt(point));
         return;
     }
     if (pressed < 0 || pressed >= static_cast<int>(tabs_.size()) || indexAt(point.x, point.y) != pressed) return;
@@ -586,12 +734,87 @@ void Strip::finishPress(D2D1_POINT_2F point) {
     }
 }
 
+// The key is copied: the callback may bring new tabs, and the one pressed goes with the old ones.
+void Strip::act(Hit control) {
+    std::wstring key;
+    if (control.kind == HoverKind::Close || control.kind == HoverKind::Collapse) key = tabs_[control.index].key;
+    if (control.kind == HoverKind::Icon) key = icons_[control.index].key;
+    switch (control.kind) {
+        case HoverKind::Privacy:
+            if (onTogglePrivacy) onTogglePrivacy();
+            break;
+        case HoverKind::Close:
+            if (onClose) onClose(key);
+            break;
+        case HoverKind::Collapse:
+            if (onCollapse) onCollapse(key);
+            break;
+        case HoverKind::Icon:
+            if (onExpand) onExpand(key);
+            break;
+        default:
+            break;
+    }
+}
+
+// ---------------------------------------------------------------- tooltip
+
+// The icons show the profile's name, the buttons what they do; tabs show their names already. One tool at
+// a time, for the element under the mouse, with a new id each time: the tooltip control takes the move to
+// the next element as a new tool and shows its text.
+void Strip::updateTooltip() {
+    if (!tooltip_) return;
+    std::wstring text;
+    D2D1_RECT_F rect{};
+    if (!tooltipMuted_ && pressIndex_ < 0 && pressed_.kind == HoverKind::None) {
+        if (hover_.kind == HoverKind::Icon) {
+            text = icons_[hover_.index].title;
+            rect = iconRect(hover_.index);
+        } else if (hover_.kind == HoverKind::Close || hover_.kind == HoverKind::Collapse) {
+            for (const auto& button : tabButtons(hover_.index, slotRect(hover_.index))) {
+                if (button.kind == hover_.kind) rect = button.rect;
+            }
+            text = hover_.kind == HoverKind::Close     ? L"Close profile"
+                   : tabs_[hover_.index].isOpen ? L"Close and collapse to icon"
+                                                : L"Collapse to icon";
+        }
+    }
+    float s = scale();
+    RECT pixels{std::lround(rect.left * s), std::lround(rect.top * s), std::lround(rect.right * s), std::lround(rect.bottom * s)};
+    // The same element with the same text keeps its tool, or a tooltip on screen would go away.
+    if (toolId_ && text == toolText_ && EqualRect(&pixels, &toolRect_)) return;
+    if (toolId_) {
+        TTTOOLINFOW old{sizeof(old)};
+        old.hwnd = hwnd_;
+        old.uId = toolId_;
+        SendMessageW(tooltip_, TTM_DELTOOLW, 0, reinterpret_cast<LPARAM>(&old));
+        toolId_ = 0;
+    }
+    if (text.empty()) return;
+    toolText_ = text;
+    toolRect_ = pixels;
+    TTTOOLINFOW tool{sizeof(tool)};
+    tool.hwnd = hwnd_;
+    tool.uId = toolId_ = ++lastToolId_;
+    tool.rect = pixels;
+    tool.lpszText = toolText_.data();
+    SendMessageW(tooltip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+}
+
+// The tooltip control learns where the mouse is only from the messages passed on to it.
+void Strip::relayToTooltip(UINT message, WPARAM wParam, LPARAM lParam) {
+    if (!tooltip_) return;
+    MSG msg{hwnd_, message, wParam, lParam, static_cast<DWORD>(GetMessageTime()), {}};
+    GetCursorPos(&msg.pt);
+    SendMessageW(tooltip_, TTM_RELAYEVENT, 0, reinterpret_cast<LPARAM>(&msg));
+}
+
 // ---------------------------------------------------------------- window messages
 
-void Strip::setHover(HoverKind kind, int index) {
-    if (kind == hoverKind_ && index == hoverIndex_) return;
-    hoverKind_ = kind;
-    hoverIndex_ = index;
+void Strip::setHover(Hit hit) {
+    if (hit == hover_) return;
+    hover_ = hit;
+    updateTooltip();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -665,7 +888,7 @@ LRESULT Strip::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             D2D1_POINT_2F point = dips(lParam);
             lastPoint_ = point;
-            if ((pressIndex_ >= 0 || pressedPrivacy_) && !(wParam & MK_LBUTTON)) {
+            if ((pressIndex_ >= 0 || pressed_.kind != HoverKind::None) && !(wParam & MK_LBUTTON)) {
                 // The release happened where the strip could not see it.
                 finishPress(point);
                 return 0;
@@ -678,35 +901,39 @@ LRESULT Strip::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 }
                 if (dragging_) dragTo(point.x);
             }
-            D2D1_RECT_F button = buttonRect();
-            if (point.x >= button.left && point.x <= button.right) setHover(HoverKind::Privacy, -1);
-            else {
-                int index = indexAt(point.x, point.y);
-                setHover(index >= 0 ? HoverKind::Tab : HoverKind::None, index);
-            }
+            Hit hit = hitAt(point);
+            if (hit != hover_) tooltipMuted_ = false;
+            setHover(hit);
+            relayToTooltip(message, wParam, lParam);
             return 0;
         }
         case WM_MOUSELEAVE:
             trackingLeave_ = false;
-            setHover(HoverKind::None, -1);
+            setHover(Hit{});
             return 0;
         case WM_LBUTTONDOWN:
         case WM_LBUTTONDBLCLK: {
-            SetCapture(hwnd_);
             D2D1_POINT_2F point = dips(lParam);
-            D2D1_RECT_F button = buttonRect();
+            Hit hit = hitAt(point);
+            tooltipMuted_ = true;
+            updateTooltip();
+            logLine(L"mouse down x=%.1f dips, target %d/%d, double=%d", point.x, static_cast<int>(hit.kind), hit.index,
+                    message == WM_LBUTTONDBLCLK);
+            // The second click of a double click counts only on what got the first: the first may have
+            // changed the row, and a tab may now be where an icon or a close button was.
+            if (message == WM_LBUTTONDBLCLK && hit != firstClick_) return 0;
+            if (message == WM_LBUTTONDOWN) firstClick_ = hit;
+            SetCapture(hwnd_);
             doubleClick_ = message == WM_LBUTTONDBLCLK;
-            logLine(L"mouse down x=%.1f dips, button at %.1f, double=%d", point.x, button.left, doubleClick_);
-            if (point.x >= button.left) {
-                lastPoint_ = point;
-                pressedPrivacy_ = true;
-                InvalidateRect(hwnd_, nullptr, FALSE);
-                return 0;
-            }
-            pressIndex_ = indexAt(point.x, point.y);
-            pressX_ = point.x;
             lastPoint_ = point;
-            if (pressIndex_ >= 0) SetTimer(hwnd_, kPressTimer, 15, nullptr);
+            if (hit.kind == HoverKind::Tab) {
+                pressIndex_ = hit.index;
+                pressX_ = point.x;
+                SetTimer(hwnd_, kPressTimer, 15, nullptr);
+            } else if (hit.kind != HoverKind::None) {
+                pressed_ = hit;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             return 0;
         }
         case WM_LBUTTONUP:
@@ -714,19 +941,24 @@ LRESULT Strip::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_CAPTURECHANGED:
             // Losing the capture with the button still held (another window took it) cancels the press.
-            if (reinterpret_cast<HWND>(lParam) != hwnd_ && (pressIndex_ >= 0 || pressedPrivacy_) && leftButtonDown()) {
+            if (reinterpret_cast<HWND>(lParam) != hwnd_ && (pressIndex_ >= 0 || pressed_.kind != HoverKind::None) && leftButtonDown()) {
                 KillTimer(hwnd_, kPressTimer);
-                dragging_ = pressedPrivacy_ = doubleClick_ = false;
+                dragging_ = doubleClick_ = false;
+                pressed_ = Hit{};
                 pressIndex_ = -1;
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return 0;
+        case WM_RBUTTONDOWN:
+            tooltipMuted_ = true;
+            updateTooltip();
+            return 0;
         case WM_RBUTTONUP: {
             D2D1_POINT_2F point = dips(lParam);
-            int index = indexAt(point.x, point.y);
+            int index = indexAt(point.x, point.y), icon = iconAt(point.x);
             POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ClientToScreen(hwnd_, &screen);
-            std::wstring key = index >= 0 ? tabs_[index].key : std::wstring();
+            std::wstring key = icon >= 0 ? icons_[icon].key : index >= 0 ? tabs_[index].key : std::wstring();
             if (onContextMenu) onContextMenu(key, screen);
             return 0;
         }
