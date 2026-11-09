@@ -5,3 +5,4 @@ macos/.swiftpm/
 macos/dist.noindex/
 windows/build/
 windows/dist/
+.idea/
